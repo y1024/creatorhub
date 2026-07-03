@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Node (xhs publish signing deps)
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code 本地技能/配置(不随仓库发布)
+.claude/
+
+# Runtime data (login states, downloaded media, sqlite db, uploads)
+data/
+*.db
+config.yaml
+
+# 内部方案文档(不随公开仓库发布)
+docs/

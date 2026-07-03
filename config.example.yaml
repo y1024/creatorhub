@@ -1,0 +1,39 @@
+# 复制为 config.yaml 后修改
+server:
+  host: 0.0.0.0
+  port: 8000
+
+engine:
+  scan_interval_seconds: 300      # 每个监控目标的轮询间隔
+  worker_pool_size: 2             # 并发下载数(跨作品)
+  scan_concurrency: 2             # 同时抓取的目标数(并发浏览器上下文)
+  block_media_resources: false    # 屏蔽图片/视频/字体加载(省带宽但会打断抖音 SPA 致拿不到数据,建议保持 false)
+  comment_recent_works: 5         # 监控评论时,只看每个目标最近 N 条作品
+  comment_recent_days: 7          # 且仅限最近多少天内发布的作品
+  comment_max_scrolls: 6          # 评论区翻页深度(滚动容器次数,越大扫得越深)
+  account_check_interval_seconds: 1800   # 账号登录态定时体检间隔(秒,0=关闭)
+  # 自有账号评论模式(创作中心)页面 URL —— 实验性,抖音改版/字段变了改这里
+  creator_comment_url: https://creator.douyin.com/creator-micro/interaction/comment-management
+  request_timeout_seconds: 20
+  download_timeout_seconds: 120
+  media_dir: ./data/media         # 下载文件落地目录
+  user_agent: >-
+    Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+    (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36
+
+  # ── 多账号风控隔离 ──
+  profiles_dir: ./data/profiles   # 每账号独立持久化浏览器 profile 根目录
+  max_live_contexts: 6            # 同时常驻的浏览器 context 上限(LRU 驱逐,控内存;20+账号无需全开)
+  active_accounts: 3              # 同一时刻最多并发活跃的账号数(错峰,降低"多号同时活跃"特征)
+  scan_jitter: 0.15              # 扫描间隔随机抖动比例(±15%),消除整点齐发特征
+  route_download_via_proxy: true  # 媒体下载是否走账号代理(避免 CDN 拉流暴露真实 IP)
+
+storage:
+  db_path: ./data/creatorhub.db
+
+# 代理池:建号时一号一代理 sticky 分配(占用最少优先)。务必用住宅/4G 长效代理,
+# 一号一长效固定 IP,IP 地区与账号时区/locale 一致;切勿机房 IP、切勿多号共享一个 IP。
+# 支持 http / https / socks5,可带账号密码。留空则不分配(走宿主真实 IP,多账号有关联风险)。
+proxies: []
+  # - http://user:pass@gateway.example.com:8000
+  # - socks5://user:pass@1.2.3.4:1080

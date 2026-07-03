@@ -1,0 +1,494 @@
+"""用真实浏览器打开用户主页,拦截抖音自己发的 post 接口响应,
+直接拿到 aweme_list —— 绕过自算 a_bogus。
+对应原项目 engine.ContentChecker + NativeClient 的抓取角色。
+
+优化:屏蔽图片/视频/字体资源(只取数据,省带宽提速)、无新增即提前停止下滑。
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Set, Tuple
+
+from .identity import Identity
+from .manager import BrowserManager
+
+POST_API = "aweme/v1/web/aweme/post"
+PROFILE_API = "aweme/v1/web/user/profile/other"
+COMMENT_API = "aweme/v1/web/comment/list"
+
+
+async def fetch_videos(mgr: BrowserManager, identity: Identity, sec_uid: str,
+                       known_ids: Set[str], max_scrolls: int = 12,
+                       settle_ms: int = 1800, block_media: bool = True
+                       ) -> Tuple[List[dict], Optional[dict], str]:
+    """打开主页并下滑,收集作品。返回 (新作品列表, 作者信息dict, error)。"""
+    collected: Dict[str, dict] = {}
+    author: Optional[dict] = None
+    error = ""
+
+    page = await mgr.new_page(identity, block_media)
+
+    async def on_response(resp):
+        nonlocal author
+        url = resp.url
+        try:
+            if POST_API in url:
+                data = await resp.json()
+                for it in (data.get("aweme_list") or []):
+                    aid = str(it.get("aweme_id") or "")
+                    if aid:
+                        collected[aid] = it
+                        if author is None and it.get("author"):
+                            author = it["author"]
+            elif PROFILE_API in url and author is None:
+                data = await resp.json()
+                if data.get("user"):
+                    author = data["user"]
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
+    try:
+        await page.goto(f"https://www.douyin.com/user/{sec_uid}",
+                        wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(settle_ms)
+        stagnant = 0
+        for _ in range(max_scrolls):
+            if known_ids & set(collected.keys()):      # 翻到旧内容了
+                break
+            before = len(collected)
+            await page.mouse.wheel(0, 4000)
+            await page.wait_for_timeout(settle_ms)
+            if len(collected) == before:               # 本次下滑无新增
+                stagnant += 1
+                if stagnant >= 2:                      # 连续两次到底,停
+                    break
+            else:
+                stagnant = 0
+        if not collected:
+            error = "未拦截到作品数据(可能未登录/被风控/该用户无公开作品)"
+    except Exception as e:
+        error = f"打开主页失败: {e!r}"
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    new_items = [it for aid, it in collected.items() if aid not in known_ids]
+    return new_items, author, error
+
+
+# 滚动评论区的可滚动容器(而不是整页),驱动抖音自己的分页请求
+_SCROLL_COMMENTS = """
+() => {
+  const item = document.querySelector('[data-e2e="comment-item"]')
+            || document.querySelector('[data-e2e="comment-list"]');
+  if (!item) { window.scrollBy(0, 3000); return false; }
+  let el = item;
+  while (el && el !== document.body) {
+    const oy = getComputedStyle(el).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 20) {
+      el.scrollTop = el.scrollHeight;
+      return true;
+    }
+    el = el.parentElement;
+  }
+  window.scrollBy(0, 3000);
+  return false;
+}
+"""
+
+
+async def fetch_comments(mgr: BrowserManager, identity: Identity, aweme_id: str,
+                         known_cids: Set[str], max_scrolls: int = 6,
+                         settle_ms: int = 1600, block_media: bool = True
+                         ) -> Tuple[List[dict], str]:
+    """打开作品详情页,滚动评论容器翻页,拦截评论列表接口收集评论原始 JSON。
+    返回 (新评论原始列表, error)。注意:抖音评论默认按热度排序,非严格时间序,
+    只能尽量翻页扫到前若干页的新评论。
+    """
+    collected: Dict[str, dict] = {}
+    error = ""
+    page = await mgr.new_page(identity, block_media)
+
+    async def on_response(resp):
+        if COMMENT_API in resp.url:
+            try:
+                data = await resp.json()
+            except Exception:
+                return
+            for c in (data.get("comments") or []):
+                cid = str(c.get("cid") or "")
+                if cid:
+                    collected[cid] = c
+
+    page.on("response", on_response)
+    try:
+        await page.goto(f"https://www.douyin.com/video/{aweme_id}",
+                        wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(settle_ms)
+        stagnant = 0
+        for _ in range(max_scrolls):
+            before = len(collected)
+            try:
+                await page.evaluate(_SCROLL_COMMENTS)
+            except Exception:
+                pass
+            await page.wait_for_timeout(settle_ms)
+            if len(collected) == before:        # 本次没翻出新评论
+                stagnant += 1
+                if stagnant >= 2:               # 连续两次到底,停
+                    break
+            else:
+                stagnant = 0
+    except Exception as e:
+        error = f"打开作品页失败: {e!r}"
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    if not collected and not error:
+        error = "未拦截到评论(可能未登录/评论区未加载/作品无评论)"
+    new = [c for cid, c in collected.items() if cid not in known_cids]
+    return new, error
+
+
+# ── 抖音发评论(浏览器自动化)──
+# 评论输入框 / 发送按钮选择器(抖音改版时改这里。data-e2e 较稳,排前)
+_COMMENT_INPUT = [
+    '[data-e2e="comment-input"]',
+    'div.comment-input-inner [contenteditable="true"]',
+    'div[data-e2e="comment-publish"] [contenteditable="true"]',
+    '.comment-input [contenteditable="true"]',
+    'div[contenteditable="true"][data-line-wrapper]',
+    'div[contenteditable="true"]',
+]
+_COMMENT_SUBMIT = [
+    '[data-e2e="comment-publish"]',
+    'div.comment-input-area button:has-text("发送")',
+    'button:has-text("发送")',
+    'span:has-text("发送")',
+]
+# 抖音发表评论接口(权威成功判据:拦截它的响应看 status_code)
+_PUBLISH_API = "aweme/v1/web/comment/publish"
+
+# 找不到输入框时,导出页面真实结构,便于对症补选择器
+_DIAG_INPUTS = """
+() => {
+  const ce = [];
+  document.querySelectorAll('[contenteditable]').forEach(el => {
+    ce.push(((el.tagName || '') + '.' + (typeof el.className === 'string' ? el.className : ''))
+      .slice(0, 70) + ' | ph=' +
+      (el.getAttribute('data-placeholder') || el.getAttribute('placeholder')
+       || el.getAttribute('aria-label') || '').slice(0, 30));
+  });
+  const e2e = [];
+  document.querySelectorAll('[data-e2e]').forEach(el => {
+    const v = el.getAttribute('data-e2e');
+    if (v && /comment|input|publish|reply|editor/i.test(v)) e2e.push(v);
+  });
+  return JSON.stringify({ ce: ce.slice(0, 12), e2e: [...new Set(e2e)].slice(0, 20),
+                          url: location.href });
+}
+"""
+
+
+async def post_comment_browser(mgr: BrowserManager, identity: Identity, aweme_id: str,
+                               content: str, reply_to_text: str = "", headed: bool = True,
+                               settle_ms: int = 1800, timeout_ms: int = 12000
+                               ) -> Tuple[bool, str]:
+    """用账号持久 profile(已含登录态)打开作品页,在评论框输入并发送。
+    headed=True:弹真实浏览器窗口(抖音对无头写操作常降级/拦截,有头更稳,且能手动过验证码)。
+    成功判据 = 拦截抖音 comment/publish 接口响应的 status_code(0=成功),
+    而非"输入框是否清空"(后者会被验证码/频控误判为成功)。
+    reply_to_text 非空:尝试定位含该文本的评论、点其「回复」内联输入;失败回退顶层评论。
+    返回 (ok, error)。⚠️ 选择器随抖音改版可能失效,集中在 _COMMENT_INPUT/_COMMENT_SUBMIT。"""
+    content = (content or "").strip()
+    if not content:
+        return False, "空文案"
+    ctx = None
+    if headed:
+        ctx = await mgr.open_headed(identity)   # 同 profile 有头窗口(关闭即落盘 Cookie)
+        page = await ctx.new_page()
+    else:
+        page = await mgr.new_page(identity, block_media=False)
+    # 拦截发表接口响应(权威判据)
+    pub = {"seen": False, "ok": False, "code": None, "msg": ""}
+
+    async def on_response(resp):
+        if _PUBLISH_API in resp.url and not pub["seen"]:
+            try:
+                data = await resp.json()
+            except Exception:
+                return
+            pub["seen"] = True
+            pub["code"] = data.get("status_code")
+            pub["ok"] = data.get("status_code") == 0
+            pub["msg"] = data.get("status_msg") or ""
+
+    page.on("response", on_response)
+    try:
+        await page.goto(f"https://www.douyin.com/video/{aweme_id}",
+                        wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(settle_ms)
+        if "passport" in page.url or "/login" in page.url:
+            return False, "logged_out:账号未登录,无法发评论"
+
+        # 评论区懒加载:显式等输入框出现(全是 CSS 选择器,可合并等待),并轻滚一下触发渲染
+        try:
+            await page.evaluate("() => window.scrollBy(0, 600)")
+            await page.wait_for_selector(",".join(_COMMENT_INPUT), timeout=8000,
+                                         state="attached")
+        except Exception:
+            pass
+
+        editor = None
+        # 回复模式:先在评论区找到目标评论,点它的「回复」打开内联框
+        if reply_to_text:
+            try:
+                await page.evaluate(_SCROLL_COMMENTS)
+                await page.wait_for_timeout(1200)
+                item = page.locator('[data-e2e="comment-item"]', has_text=reply_to_text[:20]).first
+                if await item.count():
+                    rbtn = item.get_by_text("回复", exact=False).first
+                    await rbtn.click(timeout=4000)
+                    await page.wait_for_timeout(800)
+                    editor = page.locator('[contenteditable="true"]').last
+            except Exception:
+                editor = None  # 回退到顶层评论框
+
+        if editor is None:
+            for sel in _COMMENT_INPUT:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count():
+                        editor = loc
+                        break
+                except Exception:
+                    continue
+        if editor is None:
+            diag = ""
+            try:
+                diag = await page.evaluate(_DIAG_INPUTS)
+            except Exception:
+                pass
+            print(f"[comment_post] 未找到输入框 aweme={aweme_id} diag={diag}")
+            return False, ("未找到评论输入框(评论区可能未加载/被关闭/页面改版)。"
+                           f"页面诊断: {diag[:300]}")
+
+        await editor.click(timeout=timeout_ms)
+        await page.wait_for_timeout(300)
+        await page.keyboard.type(content, delay=40)   # 逐字输入,更像真人
+        await page.wait_for_timeout(600)
+
+        # 优先点发送按钮;找不到则回车提交
+        sent = False
+        for sel in _COMMENT_SUBMIT:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() and await btn.is_enabled():
+                    await btn.click(timeout=3000)
+                    sent = True
+                    break
+            except Exception:
+                continue
+        if not sent:
+            try:
+                await page.keyboard.press("Enter")
+                sent = True
+            except Exception:
+                pass
+        if not sent:
+            return False, "未找到发送按钮且回车提交失败"
+
+        # 等抖音的发表接口回包(权威判据),最多 ~8s
+        for _ in range(27):
+            if pub["seen"]:
+                break
+            await page.wait_for_timeout(300)
+
+        if pub["seen"]:
+            if pub["ok"]:
+                return True, ""
+            return False, (f"抖音拒绝评论(status_code={pub['code']}"
+                           f"{' ' + pub['msg'] if pub['msg'] else ''})—— 多为验证码/频控/风控,"
+                           f"请降低频率或换号稍后再试")
+
+        # 没等到发表接口:多半是点击没真正触发提交,或被前置验证拦下
+        try:
+            left = (await editor.inner_text())[:50]
+        except Exception:
+            left = ""
+        if content[:8] in left:
+            return False, "已输入但未触发发表(可能弹了验证码/发送按钮未激活)"
+        return False, "未捕获到抖音发表接口响应,无法确认是否成功(请人工核对该作品评论区)"
+    except Exception as e:
+        return False, f"发评论异常: {e!r}"
+    finally:
+        try:
+            if ctx is not None:
+                await ctx.close()   # 有头:关 context 即落盘 Cookie
+            else:
+                await page.close()
+        except Exception:
+            pass
+
+
+def _extract_user(data) -> Optional[dict]:
+    """从 profile 响应里挖出 user 对象(多结构兜底)。"""
+    if not isinstance(data, dict):
+        return None
+    for u in (data.get("user"), data.get("user_info"), data):
+        if isinstance(u, dict) and u.get("sec_uid"):
+            return u
+    return None
+
+
+async def fetch_self_profile(mgr: BrowserManager, identity: Identity,
+                             timeout_ms: int = 15000, block_media: bool = False
+                             ) -> Tuple[dict, str]:
+    """打开自己的主页,显式等待并拦截 user/profile 接口拿登录账号真实资料。
+    返回 (user dict, error)。error == "logged_out" 表示登录态失效。"""
+    result: dict = {}
+    api_seen = []                   # 看到的抖音 API 请求(诊断用)
+    error = ""
+    page = await mgr.new_page(identity, block_media)
+
+    def is_profile(resp):
+        return "aweme/v1/web/user/profile" in resp.url
+
+    async def on_response(resp):
+        url = resp.url
+        if ("douyin.com" in url and ("/aweme/v1/web/" in url or "/web/api/" in url)
+                and len(api_seen) < 40):
+            api_seen.append(f"{resp.status} {url.split('?')[0]}")
+        if is_profile(resp):
+            try:
+                data = await resp.json()
+            except Exception:
+                return
+            u = _extract_user(data)
+            if u:
+                result.update(u)
+
+    page.on("response", on_response)
+    logged_out = False
+    final_url = ""
+    has_login_btn = None
+    try:
+        for url in ("https://www.douyin.com/user/self", "https://www.douyin.com/"):
+            await page.goto(url, wait_until="load", timeout=30000)
+            try:                    # 主动等待 profile XHR(而不是死等固定时间)
+                await page.wait_for_response(
+                    lambda r: is_profile(r) and r.status == 200, timeout=timeout_ms)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+            final_url = page.url
+            if "passport" in final_url or "/login" in final_url:
+                logged_out = True
+                break
+            if result:
+                break
+        # 是否能看到“登录”按钮(看到=其实没登录进去)
+        try:
+            has_login_btn = await page.get_by_text("登录", exact=True).first.is_visible(
+                timeout=1500)
+        except Exception:
+            has_login_btn = None
+    except Exception as e:
+        error = f"{e!r}"
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    if not result:
+        if logged_out:
+            error = "logged_out"
+        elif not error:
+            error = "no_profile_xhr" if not api_seen else "profile 接口无 user 字段"
+        print(f"[self_profile] 未拿到资料; err={error}; final_url={final_url}; "
+              f"login_btn_visible={has_login_btn}; api_seen({len(api_seen)})={api_seen[:25]}")
+    return result, error
+
+
+def _dig_comment_list(data) -> list:
+    """从创作中心各种可能的响应结构里挖出评论数组(防御式)。"""
+    if not isinstance(data, dict):
+        return []
+    for key in ("comments", "comment_list", "comment_infos", "list", "data"):
+        v = data.get(key)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):     # 再下钻一层
+            for k2 in ("comments", "comment_list", "list"):
+                if isinstance(v.get(k2), list):
+                    return v[k2]
+    return []
+
+
+async def fetch_creator_comments(mgr: BrowserManager, identity: Identity,
+                                 known_cids: Set[str], page_url: str,
+                                 max_scrolls: int = 8, settle_ms: int = 1600,
+                                 block_media: bool = True
+                                 ) -> Tuple[List[dict], str]:
+    """⚠️ 实验性:打开创作中心评论管理页,拦截评论列表接口(按时间序、含刚发的)。
+    抖音改版时改 page_url 和下面的拦截判断即可。返回 (新评论原始列表, error)。
+    创作中心 Cookie 与 www 同在 .douyin.com,故复用账号同一持久 profile。
+    """
+    collected: Dict[str, dict] = {}
+    error = ""
+    page = await mgr.new_page(identity, block_media)
+
+    async def on_response(resp):
+        url = resp.url
+        # 宽松匹配:创作中心域名下任何含 comment 的接口
+        if "creator.douyin.com" in url and "comment" in url and "list" in url:
+            try:
+                data = await resp.json()
+            except Exception:
+                return
+            for c in _dig_comment_list(data):
+                cid = str(c.get("cid") or c.get("comment_id") or "")
+                if cid:
+                    collected[cid] = c
+
+    page.on("response", on_response)
+    try:
+        await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(settle_ms)
+        # 若被重定向到登录页,说明创作者登录态失效
+        if "/login" in page.url or "passport" in page.url:
+            error = "创作者登录态已失效,请重新创作者登录"
+        else:
+            stagnant = 0
+            for _ in range(max_scrolls):
+                before = len(collected)
+                try:
+                    await page.evaluate("() => window.scrollBy(0, document.body.scrollHeight)")
+                except Exception:
+                    pass
+                await page.wait_for_timeout(settle_ms)
+                if len(collected) == before:
+                    stagnant += 1
+                    if stagnant >= 2:
+                        break
+                else:
+                    stagnant = 0
+            if not collected:
+                error = error or "未拦截到创作中心评论(页面/接口可能已改版,见 README)"
+    except Exception as e:
+        error = f"打开创作中心失败: {e!r}"
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    new = [c for cid, c in collected.items() if cid not in known_cids]
+    return new, error
