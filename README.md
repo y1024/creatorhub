@@ -10,15 +10,27 @@
 
 ## 界面预览
 
-**总览面板** —— 顶部一键切换 **抖音 / 小红书 / 快手**，深浅主题随平台自动切换：
+**总览面板** —— 顶部一键切换 **抖音 / 小红书 / 快手**，深浅主题随平台自动切换，近 7 天采集趋势与关键指标一屏看全：
 
 ![总览面板 · 抖音（深色）](assets/screenshots/overview-douyin.png)
 
 ![总览面板 · 小红书（浅色）](assets/screenshots/overview-xiaohongshu.png)
 
-**账号管理 + 代理池** —— 多账号登录态检测、一键重登，一号一代理防关联：
+**账号 + 代理池** —— 扫码 / 创作者 / Cookie 多方式登录，多账号登录态检测与一键重登；一号一代理固定绑定防关联，支持批量导入与自动分配：
 
-![账号管理与代理池](assets/screenshots/accounts.png)
+![账号登录与代理池](assets/screenshots/accounts-proxy.png)
+
+**作品监控** —— 粘贴主页链接即可轮询新作品并自动下载，可选画质与下载目录；最新作品列表带下载状态，支持一键搬运到小红书：
+
+![作品监控与下载](assets/screenshots/monitor-posts.png)
+
+**评论监控** —— 订阅单条视频或整个账号的评论区，定时抓取新评论并落库，支持公开评论区来源与自动识别：
+
+![评论监控](assets/screenshots/monitor-comments.png)
+
+**本账号管理** —— 打通本账号的作品 / 关注 / 粉丝 / 私信；私信支持无头历史拉取与浏览器实时收发（imapi protobuf，纯 Cookie 免签名）：
+
+![本账号管理与私信](assets/screenshots/account-hub-dm.png)
 
 ---
 
