@@ -1762,16 +1762,19 @@ function _pvRender(d) {
   }
   cap.textContent = d.desc || "";
 }
-async function _pvOpen(fetcher) {
+async function _pvOpen(fetcher, startIdx) {
   const ov = $("preview"), box = $("pv-media");
   PV_N = 0; PV_I = 0;
   box.innerHTML = `<div class="pv-loading">加载中…</div>`; $("pv-cap").textContent = "";
   ov.style.display = "flex";
-  try { _pvRender(await fetcher()); }
+  try {
+    _pvRender(await fetcher());
+    if (startIdx && PV_N > 1) { PV_I = Math.max(0, Math.min(startIdx, PV_N - 1)); pvUpdate(); }
+  }
   catch (e) { box.innerHTML = `<div class="pv-loading">预览失败:${esc(e.message)}</div>`; }
 }
-function openPreview(id) {
-  return _pvOpen(() => api("/api/contents/" + id + "/media"));
+function openPreview(id, startIdx) {
+  return _pvOpen(() => api("/api/contents/" + id + "/media"), startIdx || 0);
 }
 function openPubPreview(accId, noteId, tok, src) {
   return _pvOpen(() => api(`/api/publish/note-media?account_id=${accId}&note_id=${encodeURIComponent(noteId)}&xsec_token=${encodeURIComponent(tok || "")}&xsec_source=${encodeURIComponent(src || "")}`));
@@ -2069,7 +2072,7 @@ function rpDrawThumbs() {
     <div class="rp-th" draggable="true" data-pos="${pos}"
          ondragstart="rpDragStart(${pos},event)" ondragover="rpDragOver(${pos},event)"
          ondragleave="rpDragLeave(event)" ondrop="rpDrop(${pos},event)" ondragend="rpDragEnd()">
-      <img src="${esc(m.url)}" referrerpolicy="no-referrer" draggable="false" alt="" title="点击看大图" onclick="openPreview(${REPOST_ID})">
+      <img src="${esc(m.url)}" referrerpolicy="no-referrer" draggable="false" alt="" title="点击看大图" onclick="openPreview(${REPOST_ID},${m.idx})">
       <span class="rp-th-badge${pos === 0 ? " cover" : ""}">${pos === 0 ? "封面" : pos + 1}</span>
       <button type="button" class="rp-th-x" title="移除这张" onclick="rpImgRemove(${pos})">✕</button>
       <div class="rp-th-mv">

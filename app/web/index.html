@@ -244,6 +244,8 @@
     background:rgba(6,7,10,.82); backdrop-filter:blur(6px); padding:24px;
     animation:slideIn .18s var(--ease);
   }
+  /* 预览层要能盖在转发弹窗(#repost 同为 pv-overlay)之上,否则点缩略图看不到大图 */
+  #preview { z-index:110; }
   .pv-box {
     position:relative; background:var(--surface); border:1px solid var(--line);
     border-radius:var(--r-lg); box-shadow:var(--sh);
