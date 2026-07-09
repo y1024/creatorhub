@@ -141,7 +141,28 @@ class MonitorEngine:
                 log.exception("scan loop error: %s", e)
             await asyncio.sleep(15)
 
-    # ── 账号登录态定时体检 ──
+    def _stamp_active(self, account_id) -> None:
+        """记录账号「刚被成功摸活」的时刻。任何一次成功的网络/浏览器动作都算活跃,
+        闲置保活据此跳过近期已活跃的账号,避免重复请求、减少风控暴露面。"""
+        if not account_id:
+            return
+        with get_session() as s:
+            a = s.get(DouyinAccount, account_id)
+            if a:
+                a.last_active_at = datetime.utcnow()
+                s.add(a); s.commit()
+
+    def _keepalive_due(self, last_active_at) -> bool:
+        """闲置判定:从未活跃、或距上次活跃超过 idle_keepalive_hours(带 ±jitter 错峰)才需保活。
+        idle_keepalive_hours<=0 时退回旧行为(每轮都摸)。"""
+        hours = self.cfg.engine.idle_keepalive_hours
+        if hours <= 0 or last_active_at is None:
+            return True
+        jitter = max(0.0, self.cfg.engine.scan_jitter)
+        factor = 1.0 + random.uniform(-jitter, jitter) if jitter else 1.0
+        return (datetime.utcnow() - last_active_at).total_seconds() >= hours * 3600 * factor
+
+    # ── 账号登录态体检 + 闲置保活 ──
     async def _check_accounts(self):
         interval = self.cfg.engine.account_check_interval_seconds
         if interval <= 0:
@@ -154,6 +175,10 @@ class MonitorEngine:
             for a in s.exec(select(DouyinAccount)).all():
                 if not (a.storage_state or a.creator_storage_state):
                     continue
+                if a.status == "invalid":
+                    continue                       # 已失效:摸也救不活,等用户重登,别白发请求
+                if not self._keepalive_due(a.last_active_at):
+                    continue                       # 近期已被监控/发布/上轮保活摸过,跳过
                 accs.append((a.id, a.platform, a.storage_state, a.creator_storage_state,
                              a.proxy or "", self.browser.identity_for(a)))
         for aid, platform, state, creator_state, proxy, identity in accs:
@@ -193,6 +218,7 @@ class MonitorEngine:
                     else:
                         p = parse_self_user(u)
                     a.status = "active"
+                    a.last_active_at = datetime.utcnow()   # 保活成功:重置闲置计时
                     if p.get("nickname"):
                         a.nickname = p["nickname"]
                     a.sec_uid = p.get("sec_uid") or a.sec_uid
@@ -232,7 +258,11 @@ class MonitorEngine:
                 t = s.get(MonitorTarget, target_id)
                 account_id = t.account_id if t else None
             async with self._account_guard(account_id, fallback_key=f"tgt:{target_id}"):
-                return await self._scan_target_locked(target_id)
+                res = await self._scan_target_locked(target_id)
+            # 用该账号成功抓取过=登录态被有效使用,顺带续期,免得再被闲置保活重复摸
+            if account_id and res.get("ok"):
+                self._stamp_active(account_id)
+            return res
         finally:
             self._inflight.discard(target_id)
 
