@@ -12,7 +12,7 @@ from datetime import datetime
 import uuid as _uuid
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import select
@@ -1878,6 +1878,17 @@ def _content_dict(r: ContentRecord) -> dict:
     }
 
 
+def _content_local_media_path(rec: ContentRecord) -> Path | None:
+    """Return the downloaded single-file media for a content record, if usable."""
+    if not rec.local_path:
+        return None
+    path = Path(rec.local_path).expanduser()
+    try:
+        return path if path.is_file() and path.stat().st_size > 0 else None
+    except OSError:
+        return None
+
+
 @app.get("/api/contents/{cid}/media")
 async def content_media(cid: int):
     """返回一条作品/笔记的媒体直链列表,供前端预览(图集/视频)。"""
@@ -1889,11 +1900,31 @@ async def content_media(cid: int):
             medias = json.loads(rec.media_json or "[]")
         except Exception:
             medias = []
+        local_media = _content_local_media_path(rec)
         return {
             "id": rec.id, "platform": rec.platform, "desc": rec.desc,
             "media_type": rec.media_type, "cover_url": rec.cover_url,
             "local_path": rec.local_path, "medias": medias,
+            "local_url": f"/api/contents/{rec.id}/local-media" if local_media else "",
         }
+
+
+@app.api_route("/api/contents/{cid}/local-media", methods=["GET", "HEAD"])
+async def content_local_media(cid: int):
+    """Stream downloaded media from the recorded path, including HTTP Range support."""
+    with get_session() as s:
+        rec = s.get(ContentRecord, cid)
+        if not rec:
+            raise HTTPException(404, "记录不存在")
+        path = _content_local_media_path(rec)
+    if not path:
+        raise HTTPException(404, "本地媒体不存在")
+    return FileResponse(
+        path,
+        filename=path.name,
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-cache"},
+    )
 
 
 @app.post("/api/contents/{cid}/retry-download")
